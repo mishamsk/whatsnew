@@ -1043,9 +1043,16 @@ func (s *loadState) snapshot() (string, []item, bool, error, []string) {
 }
 
 type loadTickMsg struct{}
+type renderStartMsg struct {
+	key    string
+	serial int
+	text   string
+	width  int
+}
 type renderDoneMsg struct {
-	key   string
-	lines []string
+	key    string
+	serial int
+	lines  []string
 }
 
 func startLoadCmd(ctx context.Context, state *loadState) tea.Cmd {
@@ -1061,11 +1068,23 @@ func pollLoadCmd() tea.Cmd {
 	})
 }
 
-func renderMarkdownCmd(key, text string, width int) tea.Cmd {
+func debounceRenderCmd(key string, serial int, text string, width int) tea.Cmd {
+	return tea.Tick(180*time.Millisecond, func(time.Time) tea.Msg {
+		return renderStartMsg{
+			key:    key,
+			serial: serial,
+			text:   text,
+			width:  width,
+		}
+	})
+}
+
+func renderMarkdownCmd(key string, serial int, text string, width int) tea.Cmd {
 	return func() tea.Msg {
 		return renderDoneMsg{
-			key:   key,
-			lines: renderMarkdownLines(text, width),
+			key:    key,
+			serial: serial,
+			lines:  renderMarkdownLines(text, width),
 		}
 	}
 }
@@ -1149,6 +1168,8 @@ type model struct {
 	renderedBody    []string
 	renderPending   bool
 	renderingKey    string
+	renderSerial    int
+	renderActive    bool
 	ctx             context.Context
 }
 
@@ -1183,16 +1204,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, pollLoadCmd()
 	case renderDoneMsg:
+		m.renderActive = false
+		m.renderingKey = ""
 		if m.rendered == nil {
 			m.rendered = map[string][]string{}
 		}
 		m.rendered[msg.key] = msg.lines
-		if msg.key == m.renderedKey {
+		if msg.key == m.renderedKey && msg.serial == m.renderSerial {
 			m.renderedBody = msg.lines
 			m.renderPending = false
-			m.renderingKey = ""
 		}
 		return m, nil
+	case renderStartMsg:
+		if msg.key != m.renderedKey || msg.serial != m.renderSerial {
+			return m, nil
+		}
+		if m.renderActive {
+			return m, debounceRenderCmd(msg.key, msg.serial, msg.text, msg.width)
+		}
+		m.renderActive = true
+		m.renderingKey = msg.key
+		return m, renderMarkdownCmd(msg.key, msg.serial, msg.text, msg.width)
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -1254,22 +1286,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showUnavailable = !m.showUnavailable
 			m.selected = 0
 			m.scroll = 0
-		case "up", "k":
+		case "up":
 			if m.selected > 0 {
 				m.selected--
 				m.scroll = 0
 			}
-		case "down", "j":
+		case "down":
 			if m.selected < len(m.visibleIndices())-1 {
 				m.selected++
 				m.scroll = 0
 			}
-		case "pgup", "b":
+		case "pgup":
 			m.scroll -= pageSize(m.height)
 			if m.scroll < 0 {
 				m.scroll = 0
 			}
-		case "pgdown", " ", "f":
+		case "pgdown":
 			m.scroll += pageSize(m.height)
 		}
 	}
@@ -1403,11 +1435,21 @@ func (m model) renderBody(width, height int, it item) string {
 }
 
 func (m model) renderLegend(width int) string {
+	segment := func(key, action string) string {
+		return "[" + key + "] " + action
+	}
+	join := func(parts ...string) string {
+		return strings.Join(parts, "  |  ")
+	}
 	if m.loading {
-		legend := "loading...  q quit  esc quit  ctrl-c quit"
+		legend := fitLegend(width, join(
+			"loading...",
+			segment("q", "quit"),
+			segment("esc", "quit"),
+			segment("ctrl-c", "quit"),
+		), join("loading...", "[q] quit", "[esc] quit"))
 		return lipgloss.NewStyle().
 			Width(width).
-			Foreground(lipgloss.Color("230")).
 			Background(lipgloss.Color("238")).
 			Render(truncate(legend, width))
 	}
@@ -1417,15 +1459,47 @@ func (m model) renderLegend(width int) string {
 	} else {
 		mode = "show missing"
 	}
-	legend := "j/k move  space/f down  b up  / search  h " + mode + "  q quit"
+	legend := fitLegend(width, join(
+		segment("up/down", "scroll tools"),
+		segment("pgup/pgdn", "scroll changelog view"),
+		segment("/", "search"),
+		segment("h", mode),
+		segment("q", "quit"),
+	), join(
+		segment("up/down", "tools"),
+		segment("pgup/pgdn", "changelog"),
+		segment("/", "search"),
+		segment("h", "hidden"),
+		segment("q", "quit"),
+	))
 	if m.searching {
-		legend = "/" + m.searchQuery + "  enter apply  esc cancel  q quit  backspace edit"
+		legend = fitLegend(width, join(
+			"search: /"+m.searchQuery,
+			segment("enter", "apply"),
+			segment("esc", "cancel"),
+			segment("backspace", "edit"),
+			segment("q", "quit"),
+		), join(
+			"/"+m.searchQuery,
+			segment("enter", "apply"),
+			segment("esc", "cancel"),
+			segment("q", "quit"),
+		))
 	}
 	return lipgloss.NewStyle().
 		Width(width).
-		Foreground(lipgloss.Color("230")).
 		Background(lipgloss.Color("238")).
 		Render(truncate(legend, width))
+}
+
+func fitLegend(width int, full, compact string) string {
+	if width <= 0 || len(full) <= width {
+		return full
+	}
+	if len(compact) <= width {
+		return compact
+	}
+	return compact
 }
 
 func (m model) refreshRendered() (model, tea.Cmd) {
@@ -1463,14 +1537,13 @@ func (m model) refreshRendered() (model, tea.Cmd) {
 		m.renderedKey = key
 		m.renderedBody = lines
 		m.renderPending = false
-		m.renderingKey = ""
 		return m, nil
 	}
 	m.renderedKey = key
-	m.renderedBody = []string{"Rendering markdown..."}
+	m.renderedBody = append(wrapText(it.NotesBody, bodyWidth), "", "[rendering markdown...]")
 	m.renderPending = true
-	m.renderingKey = key
-	return m, renderMarkdownCmd(key, it.NotesBody, bodyWidth)
+	m.renderSerial++
+	return m, debounceRenderCmd(key, m.renderSerial, it.NotesBody, bodyWidth)
 }
 
 func (m model) visibleIndices() []int {
