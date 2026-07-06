@@ -28,6 +28,20 @@ If `brew` or `mise` is missing, that source is skipped.
 
 ## Usage
 
+Install with mise:
+
+```sh
+mise use --global go:github.com/mishamsk/whatsnew@latest
+```
+
+Then run:
+
+```sh
+whatsnew
+```
+
+For local development:
+
 ```sh
 just setup
 just run
