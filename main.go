@@ -1163,6 +1163,7 @@ type model struct {
 	showUnavailable bool
 	searching       bool
 	searchQuery     string
+	searchDraft     string
 	rendered        map[string][]string
 	renderedKey     string
 	renderedBody    []string
@@ -1206,14 +1207,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case renderDoneMsg:
 		m.renderActive = false
 		m.renderingKey = ""
+		if msg.key != m.renderedKey || msg.serial != m.renderSerial {
+			return m, nil
+		}
 		if m.rendered == nil {
 			m.rendered = map[string][]string{}
 		}
-		m.rendered[msg.key] = msg.lines
-		if msg.key == m.renderedKey && msg.serial == m.renderSerial {
-			m.renderedBody = msg.lines
-			m.renderPending = false
+		if len(m.rendered) > 32 {
+			m.rendered = map[string][]string{}
 		}
+		m.rendered[msg.key] = msg.lines
+		m.renderedBody = msg.lines
+		m.renderPending = false
 		return m, nil
 	case renderStartMsg:
 		if msg.key != m.renderedKey || msg.serial != m.renderSerial {
@@ -1241,37 +1246,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.searching {
 			switch msg.String() {
-			case "q", "ctrl+c":
+			case "ctrl+c":
 				return m, tea.Quit
 			case "esc":
 				m.searching = false
 				return m, nil
 			}
-			if msg.Type == tea.KeyRunes && strings.Contains(string(msg.Runes), "q") {
-				return m, tea.Quit
-			}
 			switch msg.Type {
 			case tea.KeyEsc:
 				m.searching = false
 			case tea.KeyEnter:
+				m.searchQuery = strings.TrimSpace(m.searchDraft)
 				m.searching = false
+				m.selected = 0
+				m.scroll = 0
 				var cmd tea.Cmd
 				m, cmd = m.refreshRendered()
 				return m, cmd
 			case tea.KeyCtrlC:
 				return m, tea.Quit
 			case tea.KeyBackspace:
-				if len(m.searchQuery) > 0 {
-					m.searchQuery = m.searchQuery[:len(m.searchQuery)-1]
-					m.selected = 0
-					m.scroll = 0
+				if len(m.searchDraft) > 0 {
+					m.searchDraft = m.searchDraft[:len(m.searchDraft)-1]
 				}
 			case tea.KeyRunes:
-				m.searchQuery += string(msg.Runes)
-				m.selected = 0
-				m.scroll = 0
+				m.searchDraft += string(msg.Runes)
 			}
-			m = m.clampSelected()
 			return m, nil
 		}
 		switch msg.String() {
@@ -1279,9 +1279,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "/":
 			m.searching = true
-			m.searchQuery = ""
-			m.selected = 0
-			m.scroll = 0
+			m.searchDraft = m.searchQuery
 		case "h":
 			m.showUnavailable = !m.showUnavailable
 			m.selected = 0
@@ -1337,7 +1335,7 @@ func (m model) View() string {
 	}
 	if len(m.items) == 0 {
 		body := lipgloss.NewStyle().Width(width).Height(bodyHeight).Render("No Homebrew or mise tools found.")
-		return body + "\n" + m.renderLegend(width)
+		return body + "\n" + m.renderFooter(width)
 	}
 	if len(visible) == 0 {
 		message := "No tools match the current filters."
@@ -1345,12 +1343,12 @@ func (m model) View() string {
 			message += " Press h to show tools without changelogs."
 		}
 		body := lipgloss.NewStyle().Width(width).Height(bodyHeight).Render(message)
-		return body + "\n" + m.renderLegend(width)
+		return body + "\n" + m.renderFooter(width)
 	}
 
 	left := m.renderList(listWidth, bodyHeight, visible)
 	right := m.renderBody(bodyWidth, bodyHeight, m.items[visible[m.selected]])
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right) + "\n" + m.renderLegend(width)
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right) + "\n" + m.renderFooter(width)
 }
 
 func (m model) renderLoading(width, height int) string {
@@ -1421,7 +1419,7 @@ func (m model) renderBody(width, height int, it item) string {
 	lines := []string{truncate(header, width), truncate(muted.Render(strings.Join(meta, " | ")), width), ""}
 	bodyLines := m.renderedBody
 	if len(bodyLines) == 0 {
-		bodyLines = wrapText(it.NotesBody, width)
+		bodyLines = previewLines(it.NotesBody, width)
 	}
 	available := max(height-len(lines), 1)
 	if m.scroll > max(len(bodyLines)-available, 0) {
@@ -1473,23 +1471,40 @@ func (m model) renderLegend(width int) string {
 		segment("q", "quit"),
 	))
 	if m.searching {
-		legend = fitLegend(width, join(
-			"search: /"+m.searchQuery,
-			segment("enter", "apply"),
-			segment("esc", "cancel"),
-			segment("backspace", "edit"),
-			segment("q", "quit"),
-		), join(
-			"/"+m.searchQuery,
-			segment("enter", "apply"),
-			segment("esc", "cancel"),
-			segment("q", "quit"),
-		))
+		return m.renderSearchFooter(width)
 	}
 	return lipgloss.NewStyle().
 		Width(width).
 		Background(lipgloss.Color("238")).
 		Render(truncate(legend, width))
+}
+
+func (m model) renderFooter(width int) string {
+	if m.searching {
+		return m.renderSearchFooter(width)
+	}
+	return m.renderLegend(width)
+}
+
+func (m model) renderSearchFooter(width int) string {
+	left := "search /" + m.searchDraft
+	right := "[esc] cancel  |  [enter] apply filter"
+	if width < len(left)+len(right)+2 {
+		right = "[esc] cancel  |  [enter] apply"
+	}
+	if width < len(left)+len(right)+2 {
+		right = "[esc]  |  [enter]"
+	}
+	line := left
+	if width > len(left)+len(right) {
+		line = left + strings.Repeat(" ", width-len(left)-len(right)) + right
+	} else if width > 0 {
+		line = truncate(left+"  "+right, width)
+	}
+	return lipgloss.NewStyle().
+		Width(width).
+		Background(lipgloss.Color("238")).
+		Render(line)
 }
 
 func fitLegend(width int, full, compact string) string {
@@ -1540,7 +1555,7 @@ func (m model) refreshRendered() (model, tea.Cmd) {
 		return m, nil
 	}
 	m.renderedKey = key
-	m.renderedBody = append(wrapText(it.NotesBody, bodyWidth), "", "[rendering markdown...]")
+	m.renderedBody = append(previewLines(it.NotesBody, bodyWidth), "", "[rendering markdown...]")
 	m.renderPending = true
 	m.renderSerial++
 	return m, debounceRenderCmd(key, m.renderSerial, it.NotesBody, bodyWidth)
@@ -1588,7 +1603,8 @@ func renderMarkdownLines(text string, width int) []string {
 	if strings.TrimSpace(text) == unavailable {
 		return []string{unavailable}
 	}
-	const maxRenderBytes = 80 * 1024
+	const maxRenderBytes = 32 * 1024
+	const maxRenderedLines = 600
 	truncated := false
 	if len(text) > maxRenderBytes {
 		text = text[:maxRenderBytes]
@@ -1614,8 +1630,30 @@ func renderMarkdownLines(text string, width int) []string {
 		return lines
 	}
 	lines := strings.Split(strings.TrimRight(rendered, "\n"), "\n")
+	if len(lines) > maxRenderedLines {
+		lines = lines[:maxRenderedLines]
+		truncated = true
+	}
 	if truncated {
 		lines = append(lines, "", "[truncated]")
+	}
+	return lines
+}
+
+func previewLines(text string, width int) []string {
+	const maxPreviewBytes = 24 * 1024
+	truncated := false
+	if len(text) > maxPreviewBytes {
+		text = text[:maxPreviewBytes]
+		truncated = true
+	}
+	lines := wrapText(text, width)
+	if len(lines) > 500 {
+		lines = lines[:500]
+		truncated = true
+	}
+	if truncated {
+		lines = append(lines, "", "[preview truncated]")
 	}
 	return lines
 }
