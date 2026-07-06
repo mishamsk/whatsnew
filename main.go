@@ -1250,11 +1250,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case "esc":
 				m.searching = false
-				return m, nil
+				m.searchDraft = m.searchQuery
+				m.selected = 0
+				m.scroll = 0
+				m = m.clampSelected()
+				var cmd tea.Cmd
+				m, cmd = m.refreshRendered()
+				return m, cmd
 			}
+			changed := false
 			switch msg.Type {
 			case tea.KeyEsc:
 				m.searching = false
+				m.searchDraft = m.searchQuery
+				m.selected = 0
+				m.scroll = 0
+				m = m.clampSelected()
+				var cmd tea.Cmd
+				m, cmd = m.refreshRendered()
+				return m, cmd
 			case tea.KeyEnter:
 				m.searchQuery = strings.TrimSpace(m.searchDraft)
 				m.searching = false
@@ -1268,9 +1282,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case tea.KeyBackspace:
 				if len(m.searchDraft) > 0 {
 					m.searchDraft = m.searchDraft[:len(m.searchDraft)-1]
+					changed = true
 				}
 			case tea.KeyRunes:
 				m.searchDraft += string(msg.Runes)
+				changed = true
+			}
+			if changed {
+				m.selected = 0
+				m.scroll = 0
+				m = m.clampSelected()
+				var cmd tea.Cmd
+				m, cmd = m.refreshRendered()
+				return m, cmd
 			}
 			return m, nil
 		}
@@ -1371,8 +1395,8 @@ func (m model) renderList(width, height int, visible []int) string {
 	selectedStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62"))
 	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	title := fmt.Sprintf("whatsnew %d/%d", len(visible), len(m.items))
-	if m.searchQuery != "" {
-		title += " /" + m.searchQuery
+	if query := m.effectiveSearchQuery(); query != "" {
+		title += " /" + query
 	}
 	lines := []string{lipgloss.NewStyle().Bold(true).Render(truncate(title, width))}
 	maxItems := max(height-2, 1)
@@ -1563,7 +1587,7 @@ func (m model) refreshRendered() (model, tea.Cmd) {
 
 func (m model) visibleIndices() []int {
 	var visible []int
-	query := strings.ToLower(strings.TrimSpace(m.searchQuery))
+	query := strings.ToLower(m.effectiveSearchQuery())
 	for idx, it := range m.items {
 		if !m.showUnavailable && !hasNotes(it) {
 			continue
@@ -1574,6 +1598,13 @@ func (m model) visibleIndices() []int {
 		visible = append(visible, idx)
 	}
 	return visible
+}
+
+func (m model) effectiveSearchQuery() string {
+	if m.searching {
+		return strings.TrimSpace(m.searchDraft)
+	}
+	return strings.TrimSpace(m.searchQuery)
 }
 
 func (m model) clampSelected() model {
