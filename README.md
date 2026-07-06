@@ -31,7 +31,7 @@ If `brew` or `mise` is missing, that source is skipped.
 Install with mise:
 
 ```sh
-mise use --global go:github.com/mishamsk/whatsnew@latest
+mise use --global go:github.com/mishamsk/whatsnew@v0.1.0 --minimum-release-age 0s
 ```
 
 Then run:
