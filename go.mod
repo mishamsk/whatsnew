@@ -1,4 +1,4 @@
-module whatsnew
+module github.com/mishamsk/whatsnew
 
 go 1.26
 
