@@ -16,13 +16,16 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 )
 
 const unavailable = "changelog is not available"
+const repoMissTTL = 30 * 24 * time.Hour
 
 type repoRef struct {
 	Owner string `json:"owner"`
@@ -37,15 +40,30 @@ func (r repoRef) String() string {
 }
 
 type cacheEntry struct {
+	Found      bool   `json:"found"`
 	Owner      string `json:"owner"`
 	Repo       string `json:"repo"`
 	ResolvedAt string `json:"resolved_at"`
+	TriedAt    string `json:"tried_at"`
 	Source     string `json:"source"`
 }
 
 type repoCache struct {
 	path   string
 	Values map[string]cacheEntry `json:"values"`
+}
+
+type noteEntry struct {
+	Found     bool   `json:"found"`
+	Title     string `json:"title"`
+	Body      string `json:"body"`
+	Source    string `json:"source"`
+	FetchedAt string `json:"fetched_at"`
+}
+
+type noteCache struct {
+	path   string
+	Values map[string]noteEntry `json:"values"`
 }
 
 type item struct {
@@ -76,49 +94,8 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	cache, err := loadCache()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "cache disabled: %v\n", err)
-		cache = &repoCache{Values: map[string]cacheEntry{}}
-	}
-
-	var items []item
-	if commandExists("brew") {
-		brewItems, err := collectBrew(ctx, cache)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "brew skipped: %v\n", err)
-		} else {
-			items = append(items, brewItems...)
-		}
-	}
-	if commandExists("mise") {
-		miseItems, err := collectMise(ctx, cache)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "mise skipped: %v\n", err)
-		} else {
-			items = append(items, miseItems...)
-		}
-	}
-	if len(items) == 0 {
-		fmt.Println("No Homebrew or mise tools found.")
-		return
-	}
-
-	gh := githubClient{
-		useGH: commandExists("gh"),
-		token: strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
-		http:  &http.Client{Timeout: 20 * time.Second},
-	}
-
-	for idx := range items {
-		fmt.Fprintf(os.Stderr, "Fetching %d/%d: %s\n", idx+1, len(items), items[idx].title())
-		fillNotes(ctx, gh, &items[idx])
-	}
-	if err := cache.save(); err != nil {
-		fmt.Fprintf(os.Stderr, "cache save failed: %v\n", err)
-	}
-
-	p := tea.NewProgram(newModel(items), tea.WithAltScreen())
+	loader := &loadState{status: "Starting whatsnew..."}
+	p := tea.NewProgram(newModel(ctx, loader), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
 		os.Exit(1)
@@ -163,17 +140,25 @@ func runText(ctx context.Context, name string, args ...string) (string, error) {
 	return string(data), nil
 }
 
-func loadCache() (*repoCache, error) {
+func cacheBaseDir() (string, error) {
 	base := strings.TrimSpace(os.Getenv("XDG_CACHE_DIR"))
 	if base == "" {
 		dir, err := os.UserCacheDir()
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 		base = dir
 	}
+	return filepath.Join(base, "whatsnew"), nil
+}
+
+func loadCache() (*repoCache, error) {
+	base, err := cacheBaseDir()
+	if err != nil {
+		return nil, err
+	}
 	c := &repoCache{
-		path:   filepath.Join(base, "whatsnew", "repos.json"),
+		path:   filepath.Join(base, "repos.json"),
 		Values: map[string]cacheEntry{},
 	}
 	data, err := os.ReadFile(c.path)
@@ -198,6 +183,15 @@ func loadCache() (*repoCache, error) {
 	if c.Values == nil {
 		c.Values = map[string]cacheEntry{}
 	}
+	for key, entry := range c.Values {
+		if entry.Owner != "" && entry.Repo != "" {
+			entry.Found = true
+		}
+		if entry.TriedAt == "" {
+			entry.TriedAt = entry.ResolvedAt
+		}
+		c.Values[key] = entry
+	}
 	return c, nil
 }
 
@@ -206,25 +200,136 @@ func (c *repoCache) get(key string) (repoRef, bool) {
 		return repoRef{}, false
 	}
 	entry, ok := c.Values[key]
-	if !ok || entry.Owner == "" || entry.Repo == "" {
+	if !ok || entry.Owner == "" || entry.Repo == "" || !entry.Found {
 		return repoRef{}, false
 	}
 	return repoRef{Owner: entry.Owner, Repo: entry.Repo}, true
+}
+
+func (c *repoCache) hasFreshMiss(key string) bool {
+	if c == nil || key == "" {
+		return false
+	}
+	entry, ok := c.Values[key]
+	if !ok || entry.Found || entry.Owner != "" || entry.Repo != "" {
+		return false
+	}
+	triedAt, err := time.Parse(time.RFC3339, entry.TriedAt)
+	if err != nil {
+		return false
+	}
+	return time.Since(triedAt) < repoMissTTL
 }
 
 func (c *repoCache) put(key string, repo repoRef, source string) {
 	if c == nil || key == "" || repo.String() == "" {
 		return
 	}
+	now := time.Now().UTC().Format(time.RFC3339)
 	c.Values[key] = cacheEntry{
+		Found:      true,
 		Owner:      repo.Owner,
 		Repo:       repo.Repo,
-		ResolvedAt: time.Now().UTC().Format(time.RFC3339),
+		ResolvedAt: now,
+		TriedAt:    now,
 		Source:     source,
 	}
 }
 
+func (c *repoCache) putMiss(key, source string) {
+	if c == nil || key == "" {
+		return
+	}
+	c.Values[key] = cacheEntry{
+		Found:   false,
+		TriedAt: time.Now().UTC().Format(time.RFC3339),
+		Source:  source,
+	}
+}
+
 func (c *repoCache) save() error {
+	if c == nil || c.path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(c.Values, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(c.path, append(data, '\n'), 0o644)
+}
+
+func loadNoteCache() (*noteCache, error) {
+	base, err := cacheBaseDir()
+	if err != nil {
+		return nil, err
+	}
+	c := &noteCache{
+		path:   filepath.Join(base, "notes.json"),
+		Values: map[string]noteEntry{},
+	}
+	data, err := os.ReadFile(c.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return c, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return c, nil
+	}
+	if err := json.Unmarshal(data, &c.Values); err != nil {
+		var wrapped struct {
+			Values map[string]noteEntry `json:"values"`
+		}
+		if err2 := json.Unmarshal(data, &wrapped); err2 != nil {
+			return nil, err
+		}
+		c.Values = wrapped.Values
+	}
+	if c.Values == nil {
+		c.Values = map[string]noteEntry{}
+	}
+	return c, nil
+}
+
+func (c *noteCache) get(key string) (noteEntry, bool) {
+	if c == nil || key == "" {
+		return noteEntry{}, false
+	}
+	entry, ok := c.Values[key]
+	return entry, ok
+}
+
+func (c *noteCache) putFound(key string, it item) {
+	if c == nil || key == "" {
+		return
+	}
+	c.Values[key] = noteEntry{
+		Found:     true,
+		Title:     it.NotesTitle,
+		Body:      it.NotesBody,
+		Source:    it.NotesSource,
+		FetchedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+func (c *noteCache) putMiss(key string) {
+	if c == nil || key == "" {
+		return
+	}
+	c.Values[key] = noteEntry{
+		Found:     false,
+		Title:     unavailable,
+		Body:      unavailable,
+		Source:    unavailable,
+		FetchedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+func (c *noteCache) save() error {
 	if c == nil || c.path == "" {
 		return nil
 	}
@@ -301,7 +406,6 @@ func collectBrew(ctx context.Context, cache *repoCache) ([]item, error) {
 	for _, f := range outdated.Formulae {
 		info, err := brewInfoFor(ctx, false, f.Name)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "brew %s skipped: %v\n", f.Name, err)
 			continue
 		}
 		if len(info.Formulae) == 0 {
@@ -322,7 +426,6 @@ func collectBrew(ctx context.Context, cache *repoCache) ([]item, error) {
 	for _, c := range outdated.Casks {
 		info, err := brewInfoFor(ctx, true, c.Name)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "brew cask %s skipped: %v\n", c.Name, err)
 			continue
 		}
 		if len(info.Casks) == 0 {
@@ -422,6 +525,10 @@ func resolveBrewFormula(ctx context.Context, cache *repoCache, it *item, f brewF
 		it.RepoSource = "cache"
 		return
 	}
+	if cache.hasFreshMiss(it.CacheKey) {
+		it.RepoSource = "repo miss cache"
+		return
+	}
 	candidates := []string{}
 	if stable, ok := f.URLs["stable"]; ok {
 		candidates = append(candidates, stable.URL)
@@ -443,12 +550,19 @@ func resolveBrewFormula(ctx context.Context, cache *repoCache, it *item, f brewF
 		return
 	}
 	resolveFromRuby(ctx, cache, it, f.Tap, f.RubySourcePath)
+	if it.Repo.String() == "" {
+		cache.putMiss(it.CacheKey, "not found")
+	}
 }
 
 func resolveBrewCask(ctx context.Context, cache *repoCache, it *item, c brewCask) {
 	if repo, ok := cache.get(it.CacheKey); ok {
 		it.Repo = repo
 		it.RepoSource = "cache"
+		return
+	}
+	if cache.hasFreshMiss(it.CacheKey) {
+		it.RepoSource = "repo miss cache"
 		return
 	}
 	if repo, tag := firstGitHubRepo([]string{c.URL, c.Homepage}); repo.String() != "" {
@@ -459,6 +573,9 @@ func resolveBrewCask(ctx context.Context, cache *repoCache, it *item, c brewCask
 		return
 	}
 	resolveFromRuby(ctx, cache, it, c.Tap, c.RubySourcePath)
+	if it.Repo.String() == "" {
+		cache.putMiss(it.CacheKey, "not found")
+	}
 }
 
 func resolveFromRuby(ctx context.Context, cache *repoCache, it *item, tap, sourcePath string) {
@@ -468,7 +585,6 @@ func resolveFromRuby(ctx context.Context, cache *repoCache, it *item, tap, sourc
 	}
 	body, err := fetchText(ctx, sourceURL)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "source fetch failed for %s: %v\n", it.Name, err)
 		return
 	}
 	repo, tag := repoFromRubySource(body)
@@ -635,6 +751,10 @@ func resolveMise(ctx context.Context, cache *repoCache, it *item, name string) {
 		it.RepoSource = "cache"
 		return
 	}
+	if cache.hasFreshMiss(it.CacheKey) {
+		it.RepoSource = "repo miss cache"
+		return
+	}
 	if strings.Contains(name, "github.com/") {
 		if repo := repoFromMiseID(name); repo.String() != "" {
 			it.Repo = repo
@@ -657,6 +777,7 @@ func resolveMise(ctx context.Context, cache *repoCache, it *item, name string) {
 		cache.put(it.CacheKey, repo, it.RepoSource)
 		return
 	}
+	cache.putMiss(it.CacheKey, "not found")
 }
 
 func repoFromMiseID(id string) repoRef {
@@ -712,10 +833,22 @@ type githubContent struct {
 	Encoding string `json:"encoding"`
 }
 
-func fillNotes(ctx context.Context, gh githubClient, it *item) {
+func fillNotes(ctx context.Context, gh githubClient, notes *noteCache, it *item) {
 	if it.Repo.String() == "" {
 		it.NotesTitle = unavailable
 		it.NotesBody = unavailable
+		return
+	}
+	key := noteKey(*it)
+	if entry, ok := notes.get(key); ok {
+		it.NotesTitle = entry.Title
+		it.NotesBody = entry.Body
+		it.NotesSource = entry.Source
+		if !entry.Found {
+			it.NotesTitle = unavailable
+			it.NotesBody = unavailable
+			it.NotesSource = "notes miss cache"
+		}
 		return
 	}
 	release, ok := fetchRelease(ctx, gh, it.Repo, candidateTags(*it))
@@ -727,16 +860,31 @@ func fillNotes(ctx context.Context, gh githubClient, it *item) {
 		it.NotesTitle = title
 		it.NotesBody = strings.TrimSpace(release.Body)
 		it.NotesSource = "GitHub release " + release.TagName
+		notes.putFound(key, *it)
 		return
 	}
 	if body, ok := fetchChangelog(ctx, gh, it.Repo); ok {
 		it.NotesTitle = "CHANGELOG.md"
 		it.NotesBody = strings.TrimSpace(body)
 		it.NotesSource = "root CHANGELOG.md"
+		notes.putFound(key, *it)
 		return
 	}
 	it.NotesTitle = unavailable
 	it.NotesBody = unavailable
+	it.NotesSource = unavailable
+	notes.putMiss(key)
+}
+
+func noteKey(it item) string {
+	version := strings.TrimSpace(it.TargetVersion)
+	if version == "" {
+		version = strings.TrimSpace(it.CurrentVersion)
+	}
+	if version == "" {
+		version = "latest"
+	}
+	return it.Repo.String() + "@" + version
 }
 
 func candidateTags(it item) []string {
@@ -855,37 +1003,233 @@ func decodeBase64(value string) (string, error) {
 	return string(data), nil
 }
 
-type model struct {
-	items         []item
-	selected      int
-	scroll        int
-	width, height int
+type loadState struct {
+	mu       sync.Mutex
+	status   string
+	items    []item
+	done     bool
+	err      error
+	warnings []string
 }
 
-func newModel(items []item) model {
-	return model{items: items}
+func (s *loadState) setStatus(status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status = status
+}
+
+func (s *loadState) addWarning(warning string) {
+	if strings.TrimSpace(warning) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.warnings = append(s.warnings, warning)
+}
+
+func (s *loadState) finish(items []item, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.items = items
+	s.err = err
+	s.done = true
+}
+
+func (s *loadState) snapshot() (string, []item, bool, error, []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	warnings := append([]string(nil), s.warnings...)
+	return s.status, s.items, s.done, s.err, warnings
+}
+
+type loadTickMsg struct{}
+
+func startLoadCmd(ctx context.Context, state *loadState) tea.Cmd {
+	return func() tea.Msg {
+		go loadItems(ctx, state)
+		return loadTickMsg{}
+	}
+}
+
+func pollLoadCmd() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
+		return loadTickMsg{}
+	})
+}
+
+func loadItems(ctx context.Context, state *loadState) {
+	cache, err := loadCache()
+	if err != nil {
+		state.addWarning("repo cache disabled: " + err.Error())
+		cache = &repoCache{Values: map[string]cacheEntry{}}
+	}
+	notes, err := loadNoteCache()
+	if err != nil {
+		state.addWarning("notes cache disabled: " + err.Error())
+		notes = &noteCache{Values: map[string]noteEntry{}}
+	}
+
+	var items []item
+	if commandExists("brew") {
+		state.setStatus("Checking Homebrew outdated tools...")
+		brewItems, err := collectBrew(ctx, cache)
+		if err != nil {
+			state.addWarning("brew skipped: " + err.Error())
+		} else {
+			items = append(items, brewItems...)
+		}
+	} else {
+		state.addWarning("brew not found; Homebrew skipped")
+	}
+
+	if commandExists("mise") {
+		state.setStatus("Checking active mise tools...")
+		miseItems, err := collectMise(ctx, cache)
+		if err != nil {
+			state.addWarning("mise skipped: " + err.Error())
+		} else {
+			items = append(items, miseItems...)
+		}
+	} else {
+		state.addWarning("mise not found; mise skipped")
+	}
+
+	if len(items) == 0 {
+		state.finish(nil, nil)
+		return
+	}
+
+	gh := githubClient{
+		useGH: commandExists("gh"),
+		token: strings.TrimSpace(os.Getenv("GITHUB_TOKEN")),
+		http:  &http.Client{Timeout: 20 * time.Second},
+	}
+	for idx := range items {
+		state.setStatus(fmt.Sprintf("Fetching notes %d/%d: %s", idx+1, len(items), items[idx].title()))
+		fillNotes(ctx, gh, notes, &items[idx])
+	}
+	state.setStatus("Saving caches...")
+	if err := cache.save(); err != nil {
+		state.addWarning("repo cache save failed: " + err.Error())
+	}
+	if err := notes.save(); err != nil {
+		state.addWarning("notes cache save failed: " + err.Error())
+	}
+	state.finish(items, nil)
+}
+
+type model struct {
+	items           []item
+	loader          *loadState
+	loading         bool
+	loadStatus      string
+	loadWarnings    []string
+	loadErr         error
+	selected        int
+	scroll          int
+	width, height   int
+	showUnavailable bool
+	searching       bool
+	searchQuery     string
+	rendered        map[string][]string
+	renderedKey     string
+	renderedBody    []string
+	ctx             context.Context
+}
+
+func newModel(ctx context.Context, loader *loadState) model {
+	return model{
+		loader:     loader,
+		loading:    true,
+		loadStatus: "Starting whatsnew...",
+		rendered:   map[string][]string{},
+		ctx:        ctx,
+	}
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	return startLoadCmd(m.ctx, m.loader)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case loadTickMsg:
+		status, items, done, err, warnings := m.loader.snapshot()
+		m.loadStatus = status
+		m.loadWarnings = warnings
+		if done {
+			m.loading = false
+			m.items = items
+			m.loadErr = err
+			m = m.clampSelected()
+			m = m.refreshRendered()
+			return m, nil
+		}
+		return m, pollLoadCmd()
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m = m.refreshRendered()
 	case tea.KeyMsg:
+		if m.loading {
+			switch msg.String() {
+			case "q", "esc", "ctrl+c":
+				return m, tea.Quit
+			}
+			return m, nil
+		}
+		if m.searching {
+			switch msg.String() {
+			case "q", "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.searching = false
+				return m, nil
+			}
+			if msg.Type == tea.KeyRunes && strings.Contains(string(msg.Runes), "q") {
+				return m, tea.Quit
+			}
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.searching = false
+			case tea.KeyEnter:
+				m.searching = false
+				m = m.refreshRendered()
+			case tea.KeyCtrlC:
+				return m, tea.Quit
+			case tea.KeyBackspace:
+				if len(m.searchQuery) > 0 {
+					m.searchQuery = m.searchQuery[:len(m.searchQuery)-1]
+					m.selected = 0
+					m.scroll = 0
+				}
+			case tea.KeyRunes:
+				m.searchQuery += string(msg.Runes)
+				m.selected = 0
+				m.scroll = 0
+			}
+			m = m.clampSelected()
+			return m, nil
+		}
 		switch msg.String() {
 		case "q", "esc", "ctrl+c":
 			return m, tea.Quit
+		case "/":
+			m.searching = true
+			m.searchQuery = ""
+			m.selected = 0
+			m.scroll = 0
+		case "h":
+			m.showUnavailable = !m.showUnavailable
+			m.selected = 0
+			m.scroll = 0
 		case "up", "k":
 			if m.selected > 0 {
 				m.selected--
 				m.scroll = 0
 			}
 		case "down", "j":
-			if m.selected < len(m.items)-1 {
+			if m.selected < len(m.visibleIndices())-1 {
 				m.selected++
 				m.scroll = 0
 			}
@@ -898,6 +1242,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scroll += pageSize(m.height)
 		}
 	}
+	m = m.clampSelected()
+	m = m.refreshRendered()
 	return m, nil
 }
 
@@ -909,9 +1255,7 @@ func pageSize(height int) int {
 }
 
 func (m model) View() string {
-	if len(m.items) == 0 {
-		return "No items.\n"
-	}
+	visible := m.visibleIndices()
 	width := m.width
 	if width <= 0 {
 		width = 100
@@ -920,32 +1264,68 @@ func (m model) View() string {
 	if height <= 0 {
 		height = 30
 	}
+	bodyHeight := max(height-1, 1)
 	listWidth := min(max(width/3, 30), 48)
 	bodyWidth := max(width-listWidth-3, 20)
-	bodyHeight := max(height-2, 1)
 
-	left := m.renderList(listWidth, bodyHeight)
-	right := m.renderBody(bodyWidth, bodyHeight)
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
+	if m.loading {
+		return m.renderLoading(width, bodyHeight) + "\n" + m.renderLegend(width)
+	}
+	if len(m.items) == 0 {
+		body := lipgloss.NewStyle().Width(width).Height(bodyHeight).Render("No Homebrew or mise tools found.")
+		return body + "\n" + m.renderLegend(width)
+	}
+	if len(visible) == 0 {
+		message := "No tools match the current filters."
+		if !m.showUnavailable {
+			message += " Press h to show tools without changelogs."
+		}
+		body := lipgloss.NewStyle().Width(width).Height(bodyHeight).Render(message)
+		return body + "\n" + m.renderLegend(width)
+	}
+
+	left := m.renderList(listWidth, bodyHeight, visible)
+	right := m.renderBody(bodyWidth, bodyHeight, m.items[visible[m.selected]])
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right) + "\n" + m.renderLegend(width)
 }
 
-func (m model) renderList(width, height int) string {
+func (m model) renderLoading(width, height int) string {
+	title := lipgloss.NewStyle().Bold(true).Render("whatsnew")
+	lines := []string{title, "", m.loadStatus}
+	if m.loadErr != nil {
+		lines = append(lines, "", "Error: "+m.loadErr.Error())
+	}
+	if len(m.loadWarnings) > 0 {
+		lines = append(lines, "", "Warnings:")
+		for _, warning := range m.loadWarnings {
+			lines = append(lines, "- "+warning)
+		}
+	}
+	lines = append(lines, "", "Loading release notes. You can quit with q, Esc, or Ctrl-C.")
+	return lipgloss.NewStyle().Width(width).Height(height).Render(strings.Join(padLines(lines, height), "\n"))
+}
+
+func (m model) renderList(width, height int, visible []int) string {
 	selectedStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62"))
 	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	lines := []string{lipgloss.NewStyle().Bold(true).Render("whatsnew")}
+	title := fmt.Sprintf("whatsnew %d/%d", len(visible), len(m.items))
+	if m.searchQuery != "" {
+		title += " /" + m.searchQuery
+	}
+	lines := []string{lipgloss.NewStyle().Bold(true).Render(truncate(title, width))}
 	maxItems := max(height-2, 1)
 	start := 0
 	if m.selected >= maxItems {
 		start = m.selected - maxItems + 1
 	}
-	for idx := start; idx < len(m.items) && len(lines) < height; idx++ {
-		it := m.items[idx]
+	for pos := start; pos < len(visible) && len(lines) < height; pos++ {
+		it := m.items[visible[pos]]
 		version := it.TargetVersion
 		if version == "" {
 			version = it.CurrentVersion
 		}
 		line := truncate(fmt.Sprintf("%s %s %s", it.Source, it.Name, version), width)
-		if idx == m.selected {
+		if pos == m.selected {
 			lines = append(lines, selectedStyle.Width(width).Render(line))
 		} else {
 			lines = append(lines, muted.Render(line))
@@ -954,8 +1334,7 @@ func (m model) renderList(width, height int) string {
 	return lipgloss.NewStyle().Width(width).Render(strings.Join(padLines(lines, height), "\n"))
 }
 
-func (m model) renderBody(width, height int) string {
-	it := m.items[m.selected]
+func (m model) renderBody(width, height int, it item) string {
 	headerStyle := lipgloss.NewStyle().Bold(true)
 	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	header := headerStyle.Render(it.title())
@@ -973,8 +1352,11 @@ func (m model) renderBody(width, height int) string {
 		meta = append(meta, it.NotesSource)
 	}
 	lines := []string{truncate(header, width), truncate(muted.Render(strings.Join(meta, " | ")), width), ""}
-	bodyLines := wrapText(it.NotesBody, width)
-	available := max(height-len(lines)-1, 1)
+	bodyLines := m.renderedBody
+	if len(bodyLines) == 0 {
+		bodyLines = wrapText(it.NotesBody, width)
+	}
+	available := max(height-len(lines), 1)
 	if m.scroll > max(len(bodyLines)-available, 0) {
 		m.scroll = max(len(bodyLines)-available, 0)
 	}
@@ -982,9 +1364,149 @@ func (m model) renderBody(width, height int) string {
 	if m.scroll < len(bodyLines) {
 		lines = append(lines, bodyLines[m.scroll:end]...)
 	}
-	footer := muted.Render("up/down select | space/b scroll | q quit")
-	lines = append(lines, truncate(footer, width))
 	return lipgloss.NewStyle().Width(width).Render(strings.Join(padLines(lines, height), "\n"))
+}
+
+func (m model) renderLegend(width int) string {
+	if m.loading {
+		legend := "loading...  q quit  esc quit  ctrl-c quit"
+		return lipgloss.NewStyle().
+			Width(width).
+			Foreground(lipgloss.Color("230")).
+			Background(lipgloss.Color("238")).
+			Render(truncate(legend, width))
+	}
+	mode := "hide missing"
+	if m.showUnavailable {
+		mode = "hide missing"
+	} else {
+		mode = "show missing"
+	}
+	legend := "j/k move  space/f down  b up  / search  h " + mode + "  q quit"
+	if m.searching {
+		legend = "/" + m.searchQuery + "  enter apply  esc cancel  q quit  backspace edit"
+	}
+	return lipgloss.NewStyle().
+		Width(width).
+		Foreground(lipgloss.Color("230")).
+		Background(lipgloss.Color("238")).
+		Render(truncate(legend, width))
+}
+
+func (m model) refreshRendered() model {
+	if m.loading || len(m.items) == 0 {
+		m.renderedKey = ""
+		m.renderedBody = nil
+		return m
+	}
+	visible := m.visibleIndices()
+	if len(visible) == 0 {
+		m.renderedKey = ""
+		m.renderedBody = nil
+		return m
+	}
+	if m.selected >= len(visible) {
+		m.selected = len(visible) - 1
+	}
+	width := m.width
+	if width <= 0 {
+		width = 100
+	}
+	listWidth := min(max(width/3, 30), 48)
+	bodyWidth := max(width-listWidth-3, 20)
+	itemIndex := visible[m.selected]
+	it := m.items[itemIndex]
+	key := fmt.Sprintf("%d:%d:%d:%s:%s", itemIndex, bodyWidth, len(it.NotesBody), it.NotesTitle, it.NotesSource)
+	if key == m.renderedKey && len(m.renderedBody) > 0 {
+		return m
+	}
+	if lines, ok := m.rendered[key]; ok {
+		m.renderedKey = key
+		m.renderedBody = lines
+		return m
+	}
+	lines := renderMarkdownLines(it.NotesBody, bodyWidth)
+	if m.rendered == nil {
+		m.rendered = map[string][]string{}
+	}
+	m.rendered[key] = lines
+	m.renderedKey = key
+	m.renderedBody = lines
+	return m
+}
+
+func (m model) visibleIndices() []int {
+	var visible []int
+	query := strings.ToLower(strings.TrimSpace(m.searchQuery))
+	for idx, it := range m.items {
+		if !m.showUnavailable && !hasNotes(it) {
+			continue
+		}
+		if query != "" && !strings.Contains(strings.ToLower(it.Name), query) {
+			continue
+		}
+		visible = append(visible, idx)
+	}
+	return visible
+}
+
+func (m model) clampSelected() model {
+	visible := m.visibleIndices()
+	if len(visible) == 0 {
+		m.selected = 0
+		m.scroll = 0
+		return m
+	}
+	if m.selected >= len(visible) {
+		m.selected = len(visible) - 1
+	}
+	if m.selected < 0 {
+		m.selected = 0
+	}
+	return m
+}
+
+func hasNotes(it item) bool {
+	return strings.TrimSpace(it.NotesBody) != "" && strings.TrimSpace(it.NotesBody) != unavailable
+}
+
+func renderMarkdownLines(text string, width int) []string {
+	if strings.TrimSpace(text) == "" {
+		return []string{""}
+	}
+	if strings.TrimSpace(text) == unavailable {
+		return []string{unavailable}
+	}
+	const maxRenderBytes = 80 * 1024
+	truncated := false
+	if len(text) > maxRenderBytes {
+		text = text[:maxRenderBytes]
+		truncated = true
+	}
+	renderer, err := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(max(width, 20)),
+	)
+	if err != nil {
+		lines := wrapText(text, width)
+		if truncated {
+			lines = append(lines, "", "[truncated]")
+		}
+		return lines
+	}
+	rendered, err := renderer.Render(text)
+	if err != nil {
+		lines := wrapText(text, width)
+		if truncated {
+			lines = append(lines, "", "[truncated]")
+		}
+		return lines
+	}
+	lines := strings.Split(strings.TrimRight(rendered, "\n"), "\n")
+	if truncated {
+		lines = append(lines, "", "[truncated]")
+	}
+	return lines
 }
 
 func wrapText(text string, width int) []string {
