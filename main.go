@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
@@ -251,14 +252,11 @@ func (c *repoCache) save() error {
 	if c == nil || c.path == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(c.Values, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.path, append(data, '\n'), 0o644)
+	return writePrivateFile(c.path, append(data, '\n'))
 }
 
 func loadNoteCache() (*noteCache, error) {
@@ -333,14 +331,25 @@ func (c *noteCache) save() error {
 	if c == nil || c.path == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(c.Values, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.path, append(data, '\n'), 0o644)
+	return writePrivateFile(c.path, append(data, '\n'))
+}
+
+func writePrivateFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
 
 type brewOutdated struct {
@@ -549,8 +558,8 @@ func resolveBrewFormula(ctx context.Context, cache *repoCache, it *item, f brewF
 		cache.put(it.CacheKey, repo, it.RepoSource)
 		return
 	}
-	resolveFromRuby(ctx, cache, it, f.Tap, f.RubySourcePath)
-	if it.Repo.String() == "" {
+	checkedRuby := resolveFromRuby(ctx, cache, it, f.Tap, f.RubySourcePath)
+	if it.Repo.String() == "" && checkedRuby {
 		cache.putMiss(it.CacheKey, "not found")
 	}
 }
@@ -572,29 +581,30 @@ func resolveBrewCask(ctx context.Context, cache *repoCache, it *item, c brewCask
 		cache.put(it.CacheKey, repo, it.RepoSource)
 		return
 	}
-	resolveFromRuby(ctx, cache, it, c.Tap, c.RubySourcePath)
-	if it.Repo.String() == "" {
+	checkedRuby := resolveFromRuby(ctx, cache, it, c.Tap, c.RubySourcePath)
+	if it.Repo.String() == "" && checkedRuby {
 		cache.putMiss(it.CacheKey, "not found")
 	}
 }
 
-func resolveFromRuby(ctx context.Context, cache *repoCache, it *item, tap, sourcePath string) {
+func resolveFromRuby(ctx context.Context, cache *repoCache, it *item, tap, sourcePath string) bool {
 	sourceURL := rubySourceURL(tap, sourcePath)
 	if sourceURL == "" {
-		return
+		return true
 	}
 	body, err := fetchText(ctx, sourceURL)
 	if err != nil {
-		return
+		return false
 	}
 	repo, tag := repoFromRubySource(body)
 	if repo.String() == "" {
-		return
+		return true
 	}
 	it.Repo = repo
 	it.TagHint = tag
 	it.RepoSource = "ruby source"
 	cache.put(it.CacheKey, repo, it.RepoSource)
+	return true
 }
 
 func rubySourceURL(tap, sourcePath string) string {
@@ -841,9 +851,9 @@ func fillNotes(ctx context.Context, gh githubClient, notes *noteCache, it *item)
 	}
 	key := noteKey(*it)
 	if entry, ok := notes.get(key); ok {
-		it.NotesTitle = entry.Title
-		it.NotesBody = entry.Body
-		it.NotesSource = entry.Source
+		it.NotesTitle = sanitizeTerminalText(entry.Title)
+		it.NotesBody = sanitizeTerminalText(entry.Body)
+		it.NotesSource = sanitizeTerminalText(entry.Source)
 		if !entry.Found {
 			it.NotesTitle = unavailable
 			it.NotesBody = unavailable
@@ -851,21 +861,22 @@ func fillNotes(ctx context.Context, gh githubClient, notes *noteCache, it *item)
 		}
 		return
 	}
-	release, ok := fetchRelease(ctx, gh, it.Repo, candidateTags(*it))
+	release, ok, transient := fetchRelease(ctx, gh, it.Repo, candidateTags(*it))
 	if ok && strings.TrimSpace(release.Body) != "" {
-		title := release.Name
+		title := sanitizeTerminalText(release.Name)
 		if title == "" {
-			title = release.TagName
+			title = sanitizeTerminalText(release.TagName)
 		}
 		it.NotesTitle = title
-		it.NotesBody = strings.TrimSpace(release.Body)
-		it.NotesSource = "GitHub release " + release.TagName
+		it.NotesBody = sanitizeTerminalText(release.Body)
+		it.NotesSource = "GitHub release " + sanitizeTerminalText(release.TagName)
 		notes.putFound(key, *it)
 		return
 	}
-	if body, ok := fetchChangelog(ctx, gh, it.Repo); ok {
+	body, ok, changelogTransient := fetchChangelog(ctx, gh, it.Repo)
+	if ok {
 		it.NotesTitle = "CHANGELOG.md"
-		it.NotesBody = strings.TrimSpace(body)
+		it.NotesBody = sanitizeTerminalText(body)
 		it.NotesSource = "root CHANGELOG.md"
 		notes.putFound(key, *it)
 		return
@@ -873,7 +884,9 @@ func fillNotes(ctx context.Context, gh githubClient, notes *noteCache, it *item)
 	it.NotesTitle = unavailable
 	it.NotesBody = unavailable
 	it.NotesSource = unavailable
-	notes.putMiss(key)
+	if !transient && !changelogTransient {
+		notes.putMiss(key)
+	}
 }
 
 func noteKey(it item) string {
@@ -915,24 +928,33 @@ func candidateTags(it item) []string {
 	return tags
 }
 
-func fetchRelease(ctx context.Context, gh githubClient, repo repoRef, tags []string) (githubRelease, bool) {
+func fetchRelease(ctx context.Context, gh githubClient, repo repoRef, tags []string) (githubRelease, bool, bool) {
+	transient := false
 	for _, tag := range tags {
 		var release githubRelease
 		if err := gh.apiJSON(ctx, fmt.Sprintf("repos/%s/releases/tags/%s", repo.String(), url.PathEscape(tag)), &release); err == nil {
-			return release, true
+			return release, true, false
+		} else if !isGitHubNotFound(err) {
+			transient = true
 		}
 	}
 	var latest githubRelease
 	if err := gh.apiJSON(ctx, fmt.Sprintf("repos/%s/releases/latest", repo.String()), &latest); err == nil {
-		return latest, true
+		return latest, true, false
+	} else if !isGitHubNotFound(err) {
+		transient = true
 	}
-	return githubRelease{}, false
+	return githubRelease{}, false, transient
 }
 
-func fetchChangelog(ctx context.Context, gh githubClient, repo repoRef) (string, bool) {
+func fetchChangelog(ctx context.Context, gh githubClient, repo repoRef) (string, bool, bool) {
+	transient := false
 	for _, name := range []string{"CHANGELOG.md", "Changelog.md", "changelog.md"} {
 		var content githubContent
 		if err := gh.apiJSON(ctx, fmt.Sprintf("repos/%s/contents/%s", repo.String(), name), &content); err != nil {
+			if !isGitHubNotFound(err) {
+				transient = true
+			}
 			continue
 		}
 		if content.Encoding != "base64" {
@@ -940,10 +962,23 @@ func fetchChangelog(ctx context.Context, gh githubClient, repo repoRef) (string,
 		}
 		decoded, err := decodeBase64(content.Content)
 		if err == nil && strings.TrimSpace(decoded) != "" {
-			return decoded, true
+			return decoded, true, false
 		}
 	}
-	return "", false
+	return "", false, transient
+}
+
+type githubStatusError struct {
+	Status int
+}
+
+func (e githubStatusError) Error() string {
+	return fmt.Sprintf("github api http %d", e.Status)
+}
+
+func isGitHubNotFound(err error) bool {
+	var statusErr githubStatusError
+	return errors.As(err, &statusErr) && statusErr.Status == http.StatusNotFound
 }
 
 func (gh githubClient) apiJSON(ctx context.Context, path string, out any) error {
@@ -984,7 +1019,7 @@ func (gh githubClient) apiJSONHTTP(ctx context.Context, path string, out any) er
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		io.Copy(io.Discard, resp.Body)
-		return fmt.Errorf("github api http %d", resp.StatusCode)
+		return githubStatusError{Status: resp.StatusCode}
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(out)
 }
@@ -1423,7 +1458,7 @@ func (m model) renderList(width, height int, visible []int) string {
 func (m model) renderBody(width, height int, it item) string {
 	headerStyle := lipgloss.NewStyle().Bold(true)
 	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	header := headerStyle.Render(it.title())
+	header := headerStyle.Render(truncate(it.title(), width))
 	meta := []string{}
 	if it.InstalledVersion != "" {
 		meta = append(meta, "installed "+it.InstalledVersion)
@@ -1440,7 +1475,7 @@ func (m model) renderBody(width, height int, it item) string {
 	if m.renderPending {
 		meta = append(meta, "rendering markdown")
 	}
-	lines := []string{truncate(header, width), truncate(muted.Render(strings.Join(meta, " | ")), width), ""}
+	lines := []string{header, muted.Render(truncate(strings.Join(meta, " | "), width)), ""}
 	bodyLines := m.renderedBody
 	if len(bodyLines) == 0 {
 		bodyLines = previewLines(it.NotesBody, width)
@@ -1627,7 +1662,71 @@ func hasNotes(it item) bool {
 	return strings.TrimSpace(it.NotesBody) != "" && strings.TrimSpace(it.NotesBody) != unavailable
 }
 
+func sanitizeTerminalText(text string) string {
+	var out strings.Builder
+	out.Grow(len(text))
+	for idx := 0; idx < len(text); {
+		b := text[idx]
+		if b == 0x1b {
+			idx = skipEscapeSequence(text, idx+1)
+			continue
+		}
+		if b < 0x20 {
+			switch b {
+			case '\n', '\r', '\t':
+				out.WriteByte(b)
+			}
+			idx++
+			continue
+		}
+		if b == 0x7f {
+			idx++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[idx:])
+		if r >= 0x80 && r <= 0x9f {
+			idx += size
+			continue
+		}
+		out.WriteString(text[idx : idx+size])
+		idx += size
+	}
+	return strings.TrimSpace(out.String())
+}
+
+func skipEscapeSequence(text string, idx int) int {
+	if idx >= len(text) {
+		return idx
+	}
+	switch text[idx] {
+	case '[':
+		idx++
+		for idx < len(text) {
+			b := text[idx]
+			idx++
+			if b >= 0x40 && b <= 0x7e {
+				return idx
+			}
+		}
+	case ']':
+		idx++
+		for idx < len(text) {
+			if text[idx] == 0x07 {
+				return idx + 1
+			}
+			if text[idx] == 0x1b && idx+1 < len(text) && text[idx+1] == '\\' {
+				return idx + 2
+			}
+			idx++
+		}
+	default:
+		return idx + 1
+	}
+	return idx
+}
+
 func renderMarkdownLines(text string, width int) []string {
+	text = sanitizeTerminalText(text)
 	if strings.TrimSpace(text) == "" {
 		return []string{""}
 	}
@@ -1672,6 +1771,7 @@ func renderMarkdownLines(text string, width int) []string {
 }
 
 func previewLines(text string, width int) []string {
+	text = sanitizeTerminalText(text)
 	const maxPreviewBytes = 24 * 1024
 	truncated := false
 	if len(text) > maxPreviewBytes {
