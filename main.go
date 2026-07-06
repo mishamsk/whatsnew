@@ -1043,6 +1043,10 @@ func (s *loadState) snapshot() (string, []item, bool, error, []string) {
 }
 
 type loadTickMsg struct{}
+type renderDoneMsg struct {
+	key   string
+	lines []string
+}
 
 func startLoadCmd(ctx context.Context, state *loadState) tea.Cmd {
 	return func() tea.Msg {
@@ -1055,6 +1059,15 @@ func pollLoadCmd() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
 		return loadTickMsg{}
 	})
+}
+
+func renderMarkdownCmd(key, text string, width int) tea.Cmd {
+	return func() tea.Msg {
+		return renderDoneMsg{
+			key:   key,
+			lines: renderMarkdownLines(text, width),
+		}
+	}
 }
 
 func loadItems(ctx context.Context, state *loadState) {
@@ -1134,6 +1147,8 @@ type model struct {
 	rendered        map[string][]string
 	renderedKey     string
 	renderedBody    []string
+	renderPending   bool
+	renderingKey    string
 	ctx             context.Context
 }
 
@@ -1162,14 +1177,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.items = items
 			m.loadErr = err
 			m = m.clampSelected()
-			m = m.refreshRendered()
-			return m, nil
+			var cmd tea.Cmd
+			m, cmd = m.refreshRendered()
+			return m, cmd
 		}
 		return m, pollLoadCmd()
+	case renderDoneMsg:
+		if m.rendered == nil {
+			m.rendered = map[string][]string{}
+		}
+		m.rendered[msg.key] = msg.lines
+		if msg.key == m.renderedKey {
+			m.renderedBody = msg.lines
+			m.renderPending = false
+			m.renderingKey = ""
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m = m.refreshRendered()
+		var cmd tea.Cmd
+		m, cmd = m.refreshRendered()
+		return m, cmd
 	case tea.KeyMsg:
 		if m.loading {
 			switch msg.String() {
@@ -1194,7 +1223,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.searching = false
 			case tea.KeyEnter:
 				m.searching = false
-				m = m.refreshRendered()
+				var cmd tea.Cmd
+				m, cmd = m.refreshRendered()
+				return m, cmd
 			case tea.KeyCtrlC:
 				return m, tea.Quit
 			case tea.KeyBackspace:
@@ -1243,8 +1274,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	m = m.clampSelected()
-	m = m.refreshRendered()
-	return m, nil
+	var cmd tea.Cmd
+	m, cmd = m.refreshRendered()
+	return m, cmd
 }
 
 func pageSize(height int) int {
@@ -1351,6 +1383,9 @@ func (m model) renderBody(width, height int, it item) string {
 	if it.NotesSource != "" {
 		meta = append(meta, it.NotesSource)
 	}
+	if m.renderPending {
+		meta = append(meta, "rendering markdown")
+	}
 	lines := []string{truncate(header, width), truncate(muted.Render(strings.Join(meta, " | ")), width), ""}
 	bodyLines := m.renderedBody
 	if len(bodyLines) == 0 {
@@ -1393,17 +1428,21 @@ func (m model) renderLegend(width int) string {
 		Render(truncate(legend, width))
 }
 
-func (m model) refreshRendered() model {
+func (m model) refreshRendered() (model, tea.Cmd) {
 	if m.loading || len(m.items) == 0 {
 		m.renderedKey = ""
 		m.renderedBody = nil
-		return m
+		m.renderPending = false
+		m.renderingKey = ""
+		return m, nil
 	}
 	visible := m.visibleIndices()
 	if len(visible) == 0 {
 		m.renderedKey = ""
 		m.renderedBody = nil
-		return m
+		m.renderPending = false
+		m.renderingKey = ""
+		return m, nil
 	}
 	if m.selected >= len(visible) {
 		m.selected = len(visible) - 1
@@ -1417,22 +1456,21 @@ func (m model) refreshRendered() model {
 	itemIndex := visible[m.selected]
 	it := m.items[itemIndex]
 	key := fmt.Sprintf("%d:%d:%d:%s:%s", itemIndex, bodyWidth, len(it.NotesBody), it.NotesTitle, it.NotesSource)
-	if key == m.renderedKey && len(m.renderedBody) > 0 {
-		return m
+	if key == m.renderedKey && (len(m.renderedBody) > 0 || m.renderPending) {
+		return m, nil
 	}
 	if lines, ok := m.rendered[key]; ok {
 		m.renderedKey = key
 		m.renderedBody = lines
-		return m
+		m.renderPending = false
+		m.renderingKey = ""
+		return m, nil
 	}
-	lines := renderMarkdownLines(it.NotesBody, bodyWidth)
-	if m.rendered == nil {
-		m.rendered = map[string][]string{}
-	}
-	m.rendered[key] = lines
 	m.renderedKey = key
-	m.renderedBody = lines
-	return m
+	m.renderedBody = []string{"Rendering markdown..."}
+	m.renderPending = true
+	m.renderingKey = key
+	return m, renderMarkdownCmd(key, it.NotesBody, bodyWidth)
 }
 
 func (m model) visibleIndices() []int {
